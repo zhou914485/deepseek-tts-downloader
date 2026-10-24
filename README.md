@@ -7,6 +7,7 @@
 
 ## 一、安装（Chrome / Edge）
 
+0. 拿到代码：`git clone https://github.com/zhou914485/deepseek-tts-downloader.git`（或直接下载 ZIP 解压）。
 1. 打开扩展管理页：Chrome 地址栏输入 `chrome://extensions`，Edge 输入 `edge://extensions`。
 2. 打开右上角 / 右下角的 **开发者模式**。
 3. 点 **加载已解压的扩展程序**，选中本文件夹 `deepseek-tts-downloader`。
