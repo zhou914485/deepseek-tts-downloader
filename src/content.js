@@ -263,35 +263,89 @@
     setTimeout(function () { try { a.remove(); } catch (e) {} URL.revokeObjectURL(url); }, 60000);
   }
 
-  var audio = { ctx: null, src: null };
+  var player = { el: null, url: null };
   function stopAudio() {
-    if (audio.src) { try { audio.src.stop(); } catch (e) {} audio.src = null; }
+    if (player.el) { try { player.el.pause(); } catch (e) {} }
+    if (player.url) { try { URL.revokeObjectURL(player.url); } catch (e) {} }
+    player.el = null; player.url = null;
   }
-  function playPCM(pcm) {
+  function playBlob(blob) {
     stopAudio();
-    if (!audio.ctx) {
-      var Ctx = window.AudioContext || window.webkitAudioContext;
-      audio.ctx = new Ctx({ sampleRate: SAMPLE_RATE });
-    }
-    var ctx = audio.ctx;
-    if (ctx.state === 'suspended') ctx.resume();
-    var samples = Math.floor(pcm.length / 2);
-    var view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-    var buf = ctx.createBuffer(1, samples, SAMPLE_RATE);
-    var ch = buf.getChannelData(0);
-    for (var i = 0; i < samples; i++) ch[i] = view.getInt16(i * 2, true) / 32768;
-    var src = ctx.createBufferSource();
-    src.buffer = buf; src.connect(ctx.destination); src.start();
-    audio.src = src;
-    src.onended = function () { if (audio.src === src) audio.src = null; };
-    return samples / SAMPLE_RATE;
+    var url = URL.createObjectURL(blob);
+    var el = new Audio(url);
+    player.url = url; player.el = el;
+    el.onended = el.onerror = function () { if (player.el === el) stopAudio(); };
+    try { el.play().catch(function () {}); } catch (e) {}
+  }
+
+  /* ---------- 版本暂存（IndexedDB） ---------- */
+  var DB_NAME = 'ds-tts-downloader';
+  var DB_VERSION = 1;
+  var MAX_TAKES = 10;
+
+  function openDB() {
+    return new Promise(function (resolve, reject) {
+      var req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = function () {
+        var db = req.result;
+        if (!db.objectStoreNames.contains('takes')) {
+          var store = db.createObjectStore('takes', { keyPath: 'id' });
+          store.createIndex('sessionId', 'sessionId', { unique: false });
+        }
+      };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }
+  function idbAllTakes() {
+    return openDB().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var req = db.transaction('takes', 'readonly').objectStore('takes').getAll();
+        req.onsuccess = function () { db.close(); resolve(req.result || []); };
+        req.onerror = function () { db.close(); reject(req.error); };
+      });
+    });
+  }
+  function idbPutTake(rec) {
+    return openDB().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction('takes', 'readwrite');
+        tx.objectStore('takes').put(rec);
+        tx.oncomplete = function () { db.close(); resolve(); };
+        tx.onerror = function () { db.close(); reject(tx.error); };
+      });
+    });
+  }
+  function idbDeleteTake(id) {
+    return openDB().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction('takes', 'readwrite');
+        tx.objectStore('takes').delete(id);
+        tx.oncomplete = function () { db.close(); resolve(); };
+        tx.onerror = function () { db.close(); reject(tx.error); };
+      });
+    });
+  }
+  function idbClearTakes(sessionId) {
+    return openDB().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction('takes', 'readwrite');
+        var req = tx.objectStore('takes').index('sessionId').openCursor(IDBKeyRange.only(sessionId));
+        req.onsuccess = function () {
+          var cur = req.result;
+          if (cur) { cur.delete(); cur.continue(); }
+        };
+        tx.oncomplete = function () { db.close(); resolve(); };
+        tx.onerror = function () { db.close(); reject(tx.error); };
+      });
+    });
   }
 
   /* ---------- 面板 ---------- */
   var state = {
     open: false, loading: false, loadError: '', messages: [],
     rows: {}, voices: [], currentVoiceId: null, voicesError: '',
-    cache: new Map()
+    takes: new Map()
   };
   var ui = {};
 
@@ -352,6 +406,18 @@
     '.status[data-phase="done"]{color:#1a9c5b}',
     '.hint{padding:16px 12px;font-size:12.5px;line-height:1.6;color:#6b6b6b;text-align:center}',
     '.foot{padding:8px 14px 10px;border-top:1px solid rgba(0,0,0,.07);font-size:11px;line-height:1.5;color:#8a8a93}',
+    '.foot-row{margin-top:6px}',
+    '.foot-btn{font-size:11px;padding:2px 8px;border-radius:6px;border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;cursor:pointer}',
+    '.foot-btn:hover{background:rgba(127,127,127,.16)}',
+    '.takes{display:flex;flex-wrap:wrap;gap:6px}',
+    '.take{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;border:1px solid rgba(0,0,0,.12);border-radius:999px;padding:1px 4px 1px 8px;background:rgba(127,127,127,.06)}',
+    '.take-play{cursor:pointer;font-weight:700;color:#4d6bfe}',
+    '.take-play:hover{text-decoration:underline}',
+    '.take-dur{color:#6b6b6b}',
+    '.take-act{cursor:pointer;padding:0 3px;border-radius:5px;color:#6b6b6b}',
+    '.take-act:hover{background:rgba(127,127,127,.18);color:#1b1b1f}',
+    '.take-act.del:hover{color:#d33a3a}',
+    '.take-empty{font-size:11.5px;color:#9a9aa3}',
     '.toast{position:fixed;left:50%;bottom:86px;transform:translate(-50%,10px);max-width:min(80vw,420px);padding:9px 14px;border-radius:10px;background:rgba(28,28,32,.94);color:#fff;font-size:12.5px;line-height:1.5;opacity:0;pointer-events:none;transition:opacity .18s ease,transform .18s ease;z-index:2147483647}',
     '.toast.show{opacity:1;transform:translate(-50%,0)}',
     '.toast.error{background:rgba(178,42,42,.95)}',
@@ -367,6 +433,11 @@
     '.icon-btn{color:#a9a9b2}',
     '.icon-btn:hover{background:rgba(255,255,255,.12);color:#fff}',
     '.hint,.foot,.status{color:#9a9aa3}',
+    '.take{border-color:rgba(255,255,255,.14);background:rgba(255,255,255,.05)}',
+    '.take-dur{color:#9a9aa3}',
+    '.take-act{color:#9a9aa3}',
+    '.take-act:hover{background:rgba(255,255,255,.14);color:#fff}',
+    '.take-empty{color:#7d7d86}',
     '.status[data-phase="done"]{color:#4ecb8b}',
     '.status[data-phase="error"]{color:#ff8a8a}',
     '}'
@@ -397,7 +468,12 @@
       ])
     ]);
     var list = h('div', { class: 'list' });
-    var foot = h('div', { class: 'foot' }, '音频为 24kHz 单声道 WAV；每次下载都会走一次官方朗读合成，会消耗朗读额度。');
+    var foot = h('div', { class: 'foot' }, [
+      h('div', {}, '每点一次「出新版本」都会重新合成一条（消耗一次朗读额度）。版本先暂存在本机，试听后挑最好的再保存。'),
+      h('div', { class: 'foot-row' }, [
+        h('button', { class: 'foot-btn', onclick: function () { clearSessionTakes(); } }, '清空本会话暂存')
+      ])
+    ]);
     var panel = h('div', { class: 'panel' }, [head, voicebar, list, foot]);
 
     shadow.appendChild(fab);
@@ -426,7 +502,7 @@
       state.voices = v.voices; state.currentVoiceId = v.currentVoiceId; state.voicesError = '';
       renderVoices();
     }).catch(function (e) { state.voicesError = e.message; renderVoices(); });
-    getHistory(sessionId, force).then(function (msgs) {
+    ensureTakes(sessionId).then(function () { return getHistory(sessionId, force); }).then(function (msgs) {
       state.messages = msgs; state.loading = false; renderList();
     }).catch(function (e) {
       state.loading = false;
@@ -460,8 +536,7 @@
     if (!id) return;
     setVoice(id).then(function () {
       state.currentVoiceId = id;
-      state.cache.clear();
-      toast('已切换到「' + (state.voices.filter(function (v) { return v.voice_id === id; }).map(voiceLabel)[0] || id) + '」，缓存已清空');
+      toast('已切换到「' + (state.voices.filter(function (v) { return v.voice_id === id; }).map(voiceLabel)[0] || id) + '」，之后的新版本用这个音色（已暂存的版本保留）');
     }).catch(function (err) { toast(err.message, 'error'); renderVoices(); });
   }
 
@@ -492,18 +567,39 @@
   }
 
   function buildRow(m) {
-    var dl = h('button', { class: 'btn primary', onclick: function () { onDownload(m); } }, '下载 WAV');
-    var pl = h('button', { class: 'btn', onclick: function () { onPlay(m); } }, '试听');
+    var gen = h('button', { class: 'btn primary', onclick: function () { makeTake(m); } }, '出新版本');
     var status = h('span', { class: 'status' }, charCount(m.content) + ' 字');
+    var takes = h('div', { class: 'takes' });
     var row = h('div', { class: 'row' }, [
       h('div', { class: 'row-head' }, [
         h('span', { class: 'badge' }, '#' + m._label),
         h('span', { class: 'preview' }, preview(m.content))
       ]),
-      h('div', { class: 'actions' }, [dl, pl, status])
+      h('div', { class: 'actions' }, [gen, status]),
+      takes
     ]);
-    state.rows[m.id] = { dl: dl, pl: pl, status: status };
+    state.rows[m.id] = { gen: gen, status: status, takes: takes };
+    renderTakes(m);
     return row;
+  }
+
+  function renderTakes(m) {
+    var r = state.rows[m.id];
+    if (!r) return;
+    var list = state.takes.get(m.id) || [];
+    r.takes.textContent = '';
+    if (!list.length) {
+      r.takes.appendChild(h('span', { class: 'take-empty' }, '还没有版本 —— 点「出新版本」生成一条'));
+      return;
+    }
+    list.forEach(function (t) {
+      r.takes.appendChild(h('span', { class: 'take' }, [
+        h('span', { class: 'take-play', title: '试听这一版', onclick: function () { playBlob(t.blob); } }, 'v' + t.index),
+        h('span', { class: 'take-dur' }, fmtDur(t.seconds)),
+        h('span', { class: 'take-act', title: '保存这一版', onclick: function () { saveBlob(t.blob, takeFileName(m, t)); } }, '↓'),
+        h('span', { class: 'take-act del', title: '删除这一版', onclick: function () { deleteTake(m, t); } }, '×')
+      ]));
+    });
   }
 
   function setRow(id, phase, text) {
@@ -511,35 +607,99 @@
     if (!r) return;
     r.status.textContent = text || '';
     r.status.setAttribute('data-phase', phase || '');
-    var busy = phase === 'working';
-    r.dl.disabled = busy; r.pl.disabled = busy;
+    r.gen.disabled = (phase === 'working');
   }
 
-  function ensurePCM(m, onProgress) {
-    if (state.cache.has(m.id)) return Promise.resolve(state.cache.get(m.id));
-    return synthesizePCM(getSessionId(), m.id, onProgress).then(function (pcm) {
-      state.cache.set(m.id, pcm);
-      return pcm;
+  var takesLoadedFor = null;
+  function ensureTakes(sessionId) {
+    if (takesLoadedFor === sessionId) return Promise.resolve();
+    takesLoadedFor = sessionId;
+    return idbAllTakes().then(function (rows) {
+      var map = new Map();
+      rows.filter(function (r) { return r && r.sessionId === sessionId; }).forEach(function (r) {
+        var arr = map.get(r.messageId);
+        if (!arr) { arr = []; map.set(r.messageId, arr); }
+        arr.push(r);
+      });
+      map.forEach(function (arr) { arr.sort(function (a, b) { return a.index - b.index; }); });
+      state.takes = map;
+    }).catch(function () { takesLoadedFor = null; });
+  }
+
+  function createTake(m, onProgress) {
+    var sessionId = getSessionId();
+    if (!sessionId) return Promise.reject(new Error('请先打开一个具体对话'));
+    return ensureTakes(sessionId).then(function () {
+      return synthesizePCM(sessionId, m.id, onProgress);
+    }).then(function (pcm) {
+      var blob = pcmToWav(pcm);
+      var arr = state.takes.get(m.id) || [];
+      var maxIndex = 0;
+      arr.forEach(function (t) { if (t.index > maxIndex) maxIndex = t.index; });
+      var take = {
+        id: 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        sessionId: sessionId,
+        messageId: m.id,
+        index: maxIndex + 1,
+        createdAt: Date.now(),
+        bytes: blob.size,
+        seconds: pcm.length / 2 / SAMPLE_RATE,
+        blob: blob
+      };
+      return idbPutTake(take).then(function () {
+        arr.push(take);
+        state.takes.set(m.id, arr);
+        return pruneTakes(m.id).then(function () { return take; });
+      });
     });
   }
-  function fileName(m) {
-    return safeName(convTitle()) + '_' + (m._label != null ? m._label : m.id) + '_' + stamp() + '.wav';
+
+  function makeTake(m) {
+    var r = state.rows[m.id];
+    if (r && r.gen.disabled) return;
+    if (r) { r.gen.disabled = true; r.status.textContent = '准备中…'; r.status.setAttribute('data-phase', 'working'); }
+    createTake(m, function (text) { if (r) r.status.textContent = text; }).then(function (take) {
+      if (r) {
+        r.status.textContent = '已暂存 v' + take.index + ' · ' + fmtDur(take.seconds);
+        r.status.setAttribute('data-phase', 'done');
+        renderTakes(m);
+      }
+    }).catch(function (e) {
+      if (r) { r.status.textContent = e.message; r.status.setAttribute('data-phase', 'error'); }
+      else toast(e.message, 'error');
+    }).then(function () { if (r) r.gen.disabled = false; });
   }
-  function onDownload(m) {
-    setRow(m.id, 'working', '准备中…');
-    ensurePCM(m, function (t) { setRow(m.id, 'working', t); }).then(function (pcm) {
-      var blob = pcmToWav(pcm);
-      saveBlob(blob, fileName(m));
-      setRow(m.id, 'done', '已保存 ' + fmtSize(blob.size) + ' · ' + fmtDur(pcm.length / 2 / SAMPLE_RATE));
-    }).catch(function (e) { setRow(m.id, 'error', e.message); });
+
+  function pruneTakes(messageId) {
+    var arr = state.takes.get(messageId) || [];
+    var victims = [];
+    while (arr.length > MAX_TAKES) victims.push(arr.shift().id);
+    state.takes.set(messageId, arr);
+    var chain = Promise.resolve();
+    victims.forEach(function (id) { chain = chain.then(function () { return idbDeleteTake(id); }); });
+    return chain;
   }
-  function onPlay(m) {
-    setRow(m.id, 'working', '准备中…');
-    ensurePCM(m, function (t) { setRow(m.id, 'working', t); }).then(function (pcm) {
-      var dur = playPCM(pcm);
-      setRow(m.id, 'done', '正在试听 ' + fmtDur(dur));
-      setTimeout(function () { if (state.rows[m.id] && state.rows[m.id].status.getAttribute('data-phase') === 'done') setRow(m.id, '', ''); }, dur * 1000 + 400);
-    }).catch(function (e) { setRow(m.id, 'error', e.message); });
+
+  function deleteTake(m, t) {
+    idbDeleteTake(t.id).catch(function () {}).then(function () {
+      var arr = (state.takes.get(m.id) || []).filter(function (x) { return x.id !== t.id; });
+      state.takes.set(m.id, arr);
+      renderTakes(m);
+    });
+  }
+
+  function takeFileName(m, t) {
+    return safeName(convTitle()) + '_' + (m._label != null ? m._label : m.id) + '_v' + t.index + '_' + stamp() + '.wav';
+  }
+
+  function clearSessionTakes() {
+    var sessionId = getSessionId();
+    if (!sessionId) return;
+    idbClearTakes(sessionId).catch(function () {}).then(function () {
+      state.takes = new Map();
+      renderList();
+      toast('已清空本会话的暂存版本');
+    });
   }
 
   /* ---------- 提示条 ---------- */
@@ -613,10 +773,9 @@
     setInline(mine, true);
     resolveMessageByText(sessionId, domText).then(function (m) {
       if (!m) throw new Error('没能定位这条消息，请用右下角「下载朗读」面板手动选择');
-      return ensurePCM(m, null).then(function (pcm) {
-        var blob = pcmToWav(pcm);
-        saveBlob(blob, fileName(m));
-        toast('已保存朗读音频 ' + fmtSize(blob.size) + ' · ' + fmtDur(pcm.length / 2 / SAMPLE_RATE));
+      return createTake(m, null).then(function (take) {
+        openPanel();
+        toast('已暂存第 ' + take.index + ' 版 · ' + fmtDur(take.seconds) + '，在面板里挑最好的那条');
       });
     }).catch(function (e) { toast(e.message, 'error'); })
       .then(function () { setInline(mine, false); });
@@ -657,10 +816,9 @@
       if (!list.length) throw new Error('这个会话里还没有可朗读的回答');
       var m = list[list.length - 1];
       m._label = list.length;
-      return ensurePCM(m, null).then(function (pcm) {
-        var blob = pcmToWav(pcm);
-        saveBlob(blob, fileName(m));
-        return { ok: true, size: blob.size, seconds: pcm.length / 2 / SAMPLE_RATE };
+      return createTake(m, null).then(function (take) {
+        saveBlob(take.blob, takeFileName(m, take));
+        return { ok: true, size: take.bytes, seconds: take.seconds };
       });
     });
   }
